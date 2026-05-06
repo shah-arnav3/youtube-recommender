@@ -1,0 +1,20 @@
+# Secrets
+config.py
+
+# Database
+db/
+
+# Data files
+data/*.json
+data/*.csv
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
