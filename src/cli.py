@@ -45,11 +45,19 @@ def bootstrap():
 
 def cmd_recommend(args):
     """
-    Run the recommendation pipeline and print results to stdout.
+    Run the recommendation pipeline, print results, then prompt for an inline rating.
 
     Bootstraps all in-memory state, then calls recommend() with the mood and
     time budget parsed from CLI args. Results are printed in a ranked list with
-    title, channel, duration, score, and watch URL for each video.
+    title, channel, duration, score, why, and watch URL for each video.
+
+    After printing results, the user is prompted to identify which video they
+    watched and whether they enjoyed it. Both prompts are optional — pressing
+    Enter at either skips the rating entirely and exits cleanly. This is
+    preferable to a separate `rate` command that requires the user to remember
+    a video ID after the fact and is unlikely to be run.
+
+    Only one rating is collected per session since the user only watched one video.
 
     Args:
         args.mood    — mood tag string (validated by argparse against VALID_MOODS)
@@ -59,24 +67,68 @@ def cmd_recommend(args):
     results, cache_hit = recommend(
         args.mood, args.minutes, idx, taste_profile, seen, cache
     )
+
     print(f"\n{'(cache hit) ' if cache_hit else ''}Top {len(results)} videos for '{args.mood}' under {args.minutes} min:\n")
     for i, r in enumerate(results, 1):
         print(f"  {i}. {r['title']}")
         print(f"     {r['channel']} — {r['duration']} — score: {r['score']}")
+        print(f"     Why: {r['why']}")
         print(f"     {r['url']}")
         print()
+
+    if not results:
+        return
+
+    # Inline rating prompt — collected while the process is still alive so the
+    # user doesn't need to remember a video ID and run a separate command later.
+    # Both prompts accept an empty Enter to skip without error.
+    print("── Rate what you watched ─────────────────────────────────────────\n")
+    watched = input(f"Which video did you watch? (1-{len(results)}, or Enter to skip): ").strip()
+
+    if not watched:
+        return
+
+    if not watched.isdigit() or not (1 <= int(watched) <= len(results)):
+        print("(invalid selection, skipped)")
+        return
+
+    video = results[int(watched) - 1]
+    rating_input = input(f"Did you enjoy it? (y/n, or Enter to skip): ").strip().lower()
+
+    if not rating_input:
+        return
+
+    if rating_input not in ("y", "n"):
+        print("(invalid input, skipped)")
+        return
+
+    rating  = 1 if rating_input == "y" else 0
+    summary = log_feedback(
+        video_id        = video["video_id"],
+        rating          = rating,
+        mood_tag        = args.mood,
+        time_budget_sec = args.minutes * 60,
+        lru_cache       = cache,
+        taste_profile   = taste_profile,
+    )
+    print(f"\n[rated] {'liked' if rating else 'disliked'}  {video['channel']} — satisfaction now {summary['channel_satisfaction_rate']:.0%}")
 
 
 def cmd_rate(args):
     """
-    Record a thumbs-up or thumbs-down rating for a video and print the feedback summary.
+    Record a rating for a video and print the feedback summary.
 
     Converts the "y"/"n" rating string from the CLI into the 0/1 integer that
     log_feedback() expects, then calls log_feedback() which writes to the DB,
     updates channel_scores, invalidates the relevant LRU cache entry, and updates
-    the in-memory taste profile's satisfaction scores.
+    the in-memory taste profile's satisfaction and affinity scores.
 
     Prints the summary dict returned by log_feedback() as formatted JSON.
+
+    This command exists for cases where the user wants to rate a video outside
+    of a recommend session — e.g. rating something watched directly on YouTube.
+    For ratings immediately after a recommend session, the inline prompt in
+    cmd_recommend is the preferred path.
 
     Args:
         args.video_id — ID of the video being rated
@@ -177,10 +229,11 @@ def main():
 
     Subcommands:
         recommend  --mood MOOD --minutes N
-            Run the recommendation pipeline and print ranked results.
+            Run the recommendation pipeline, print ranked results, then prompt
+            for an optional inline rating before exiting.
 
         rate  --video-id ID --rating y|n --mood MOOD --minutes N
-            Record feedback for a video from a previous recommendation session.
+            Record feedback for a video outside of a recommend session.
 
         stats
             Print DB row counts.
@@ -201,8 +254,9 @@ def main():
     p_rec.add_argument("--minutes", type=int, required=True)
     p_rec.add_argument("--mood",    type=str, required=True, choices=VALID_MOODS)
 
-    # rate: requires the video ID, a y/n rating, the mood context, and the time budget
-    # --minutes is included so log_feedback() can record the session's time budget
+    # rate: requires the video ID, a y/n rating, the mood context, and the time budget.
+    # --minutes is included so log_feedback() can record the session's time budget.
+    # Prefer the inline prompt in cmd_recommend for post-session ratings.
     p_rate = sub.add_parser("rate")
     p_rate.add_argument("--video-id", dest="video_id", required=True)
     p_rate.add_argument("--rating",   required=True, choices=["y", "n"])

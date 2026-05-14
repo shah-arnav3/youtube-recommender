@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.db import get_connection
+from config import AFFINITY_NUDGE
 
 
 def log_feedback(
@@ -18,6 +19,14 @@ def log_feedback(
     Log a y/n rating for a video and update all downstream state.
 
     rating: 1 = satisfied, 0 = not satisfied
+
+    Updates three things after persisting to the DB:
+      - channel_satisfaction in the taste profile (Step 5)
+      - channel_affinity in the taste profile (Step 5b)
+      - the LRU cache, evicting any entries that contained this video (Step 6)
+
+    Both in-memory updates take effect immediately so the very next query
+    reflects the rating without requiring a server restart.
 
     Returns a summary dict for the API response.
     """
@@ -49,8 +58,8 @@ def log_feedback(
                  satisfaction_rate, updated_at)
             VALUES (?, ?, ?, 1, ?, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
-                positive_ratings = positive_ratings + ?,
-                total_ratings    = total_ratings + 1,
+                positive_ratings  = positive_ratings + ?,
+                total_ratings     = total_ratings + 1,
                 satisfaction_rate = CAST(positive_ratings + ? AS REAL) / (total_ratings + 1),
                 updated_at        = ?
         """, (
@@ -76,18 +85,35 @@ def log_feedback(
     finally:
         conn.close()
 
-    # Step 5 — update taste profile in memory so next query uses fresh scores
+    # Step 5 — update channel_satisfaction in the taste profile so the next
+    # query uses the freshly computed rate rather than the value from startup.
     taste_profile["channel_satisfaction"][channel_id] = satisfaction_rate
 
-    # Step 6 — invalidate cached results containing this video
+    # Step 5b — nudge channel_affinity in the taste profile.
+    # Satisfaction and affinity are different signals: satisfaction tracks whether
+    # content from a channel is good; affinity tracks how much the user wants to
+    # see from it. A positive rating should strengthen both. A negative rating
+    # weakens affinity at half the rate to avoid harshly penalising a channel the
+    # user generally likes based on a single bad video.
+    current_affinity = taste_profile["channel_affinity"].get(channel_id, 0.0)
+    if rating == 1:
+        taste_profile["channel_affinity"][channel_id] = min(1.0, current_affinity + AFFINITY_NUDGE)
+    else:
+        taste_profile["channel_affinity"][channel_id] = max(0.0, current_affinity - AFFINITY_NUDGE * 0.5)
+
+    new_affinity = taste_profile["channel_affinity"][channel_id]
+
+    # Step 6 — invalidate cached results containing this video.
     invalidated = lru_cache.invalidate_containing(video_id)
 
     print(f"[feedback] Logged rating={rating} for {video_id} "
           f"(channel: {channel_title}, "
-          f"satisfaction: {positive_ratings}/{total_ratings} = {satisfaction_rate:.2f})")
+          f"satisfaction: {positive_ratings}/{total_ratings} = {satisfaction_rate:.2f}, "
+          f"affinity: {current_affinity:.3f} → {new_affinity:.3f})")
 
     return {
-        "status":                   "logged",
+        "status":                    "logged",
         "channel_satisfaction_rate": satisfaction_rate,
+        "channel_affinity":          new_affinity,
         "cache_entries_invalidated": invalidated,
     }

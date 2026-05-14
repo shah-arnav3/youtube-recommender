@@ -1,8 +1,11 @@
+import math
 import os
 import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.db import get_connection
+from config import AFFINITY_DECAY, SEEN_VIDEO_WINDOW_DAYS
 
 
 def build_taste_profile() -> dict:
@@ -15,7 +18,7 @@ def build_taste_profile() -> dict:
 
     Returns:
         A dict with three keys:
-            "channel_affinity"     — {channel_id: normalized_watch_frequency}
+            "channel_affinity"     — {channel_id: recency-decayed affinity score, 0.0–1.0}
             "category_weights"     — {category_id: fraction_of_total_watches}
             "channel_satisfaction" — {channel_id: satisfaction_rate}
     """
@@ -42,25 +45,37 @@ def build_taste_profile() -> dict:
     return profile
 
 
-def build_seen_video_ids() -> set[str]:
+def build_seen_video_ids(window_days: int = SEEN_VIDEO_WINDOW_DAYS) -> set[str]:
     """
-    Return the set of all video IDs present in the user's watch history.
+    Return the set of video IDs the user has watched within the recent time window.
 
-    Pulls from the full watch history rather than just subscription_videos,
-    since the user may have watched videos from non-subscribed channels.
-    Deduplication is handled in SQL via DISTINCT.
+    Rather than loading the entire watch history (which permanently blacklists every
+    video ever watched), this restricts the seen filter to the last `window_days` days.
+    Videos watched outside the window become candidates again, preventing the candidate
+    pool from silently shrinking to nothing over time.
+
+    Pulls from the full watch history rather than just subscription_videos, since
+    the user may have watched videos from non-subscribed channels. Deduplication is
+    handled in SQL via DISTINCT.
+
+    Args:
+        window_days: Number of days back to consider a video "seen". Defaults to
+                     SEEN_VIDEO_WINDOW_DAYS from config (90 days).
 
     Returns:
-        Set of video ID strings representing everything the user has watched.
+        Set of video ID strings watched within the window.
     """
     conn = get_connection()
     try:
-        rows = conn.execute("SELECT DISTINCT video_id FROM watch_history").fetchall()
+        rows = conn.execute("""
+            SELECT DISTINCT video_id FROM watch_history
+            WHERE watched_at >= datetime('now', '-' || ? || ' days')
+        """, (window_days,)).fetchall()
     finally:
         conn.close()
 
     seen = {row["video_id"] for row in rows}
-    print(f"[profile] {len(seen)} seen video IDs loaded")
+    print(f"[profile] {len(seen)} seen video IDs loaded (last {window_days} days)")
     return seen
 
 
@@ -83,44 +98,68 @@ def _load_subscribed_channel_ids(conn) -> set[str]:
 
 def build_channel_affinity(conn, subscribed_ids: set[str]) -> dict[str, float]:
     """
-    Compute a normalized watch-frequency score for each subscribed channel.
+    Compute a recency-decayed affinity score for each subscribed channel.
 
-    Counts how many times each channel appears in watch_history, filters to
-    subscribed channels only, then normalizes by dividing by the maximum count
-    so all scores fall in the range 0.0–1.0. The channel watched most frequently
-    receives a score of 1.0; all others are scaled relative to it.
+    Rather than counting raw watches, each watch event is weighted by how recently
+    it occurred using exponential decay: weight = exp(-AFFINITY_DECAY * days_ago).
+    This means recent watches contribute much more than old ones — a channel watched
+    heavily two years ago but rarely now will score lower than one watched consistently
+    this month.
+
+    Decay constant AFFINITY_DECAY = 0.005 gives a half-life of ~140 days: a watch
+    from 140 days ago contributes half as much as one from today. This is tunable
+    in config.py.
+
+    After summing decayed weights per channel, scores are normalized by dividing by
+    the maximum so all values fall in 0.0–1.0. The channel with the highest
+    recency-weighted watch count scores 1.0; all others are scaled relative to it.
 
     Args:
         conn:           An open database connection.
-        subscribed_ids: Set of channel IDs to restrict scoring to.
+        subscribed_ids: Set of channel IDs to restrict scoring to. Non-subscribed
+                        channels are filtered out after the query since subscribed_ids
+                        is a Python set and not directly available to SQLite.
 
     Returns:
         Dict mapping channel_id → affinity score (float, 0.0–1.0).
         Empty dict if no watch history exists for any subscribed channel.
     """
     rows = conn.execute("""
-        SELECT channel_id, COUNT(*) as watch_count
+        SELECT channel_id, watched_at
         FROM watch_history
         WHERE channel_id != ''
-        GROUP BY channel_id
     """).fetchall()
 
-    # Filter out non-subscribed channels after the query rather than in SQL,
-    # since subscribed_ids is a Python set and not available to SQLite directly
-    counts = {
-        row["channel_id"]: row["watch_count"]
-        for row in rows
-        if row["channel_id"] in subscribed_ids
-    }
+    now = datetime.now(timezone.utc)
+    scores: dict[str, float] = {}
 
-    if not counts:
+    for row in rows:
+        cid = row["channel_id"]
+        if cid not in subscribed_ids:
+            continue
+
+        # Compute days elapsed since this watch event; default to 365 if timestamp
+        # is missing (treated as roughly a year old, contributing minimal weight)
+        raw_ts = row["watched_at"]
+        if raw_ts:
+            try:
+                watched_at = datetime.fromisoformat(str(raw_ts).rstrip("Z")).replace(tzinfo=timezone.utc)
+                days_ago = (now - watched_at).days
+            except (ValueError, TypeError):
+                days_ago = 365
+        else:
+            days_ago = 365
+        weight   = math.exp(-AFFINITY_DECAY * days_ago)
+        scores[cid] = scores.get(cid, 0.0) + weight
+
+    if not scores:
         return {}
 
-    # Normalize so the most-watched channel scores 1.0 and all others are relative
-    max_count = max(counts.values())
+    # Normalize so the highest-scoring channel is 1.0 and all others are relative
+    max_score = max(scores.values())
     return {
-        channel_id: round(count / max_count, 4)
-        for channel_id, count in counts.items()
+        cid: round(s / max_score, 4)
+        for cid, s in scores.items()
     }
 
 

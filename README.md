@@ -14,7 +14,7 @@ The core design decision is separating candidate sourcing from taste modeling �
 
 **Layer 2 — Taste profile: your watch history.** Watch history is noisy — it contains rabbit hole content, algorithm-surfaced videos, things watched once and abandoned. It is never used as a candidate source. Instead it gets aggregated into a taste profile: which subscribed channels you actually watch most, which categories dominate your viewing, which channels you've rated positively over time. This profile is the personalization signal used to rank candidates.
 
-At server startup, the engine loads all subscription videos into an inverted index and builds the taste profile in memory. A query runs in seven steps: LRU cache check, inverted index lookup by mood, unseen filter, duration hard filter, composite scoring, min-heap top-K selection, and cache store. Feedback invalidates only the cache entries that contained the rated video, so scores update immediately without a full cache flush.
+At server startup, the engine loads all subscription videos into an inverted index and builds the taste profile in memory. A query runs in eight steps: LRU cache check, inverted index lookup by mood, unseen filter, duration hard filter, composite scoring, min-heap top-K selection, per-channel diversity cap, and cache store. Feedback invalidates only the cache entries that contained the rated video, so scores update immediately without a full cache flush.
 
 ---
 
@@ -22,14 +22,14 @@ At server startup, the engine loads all subscription videos into an inverted ind
 
 ### Inverted Index
 
-The inverted index maps YouTube category IDs to lists of video IDs from your subscription feed. At query time, a mood tag (e.g. "interesting") maps to a set of category IDs. The index retrieves matching video IDs in O(1) per category — no scanning required.
+The inverted index maps YouTube category IDs to lists of video IDs from your subscription feed. At query time, a mood tag (e.g. "learn") maps to a set of category IDs. The index retrieves matching video IDs in O(1) per category — no scanning required.
 
 ```
 category 28 (Science & Tech) : [vid_a, vid_b, vid_c, ...]
 category 27 (Education)      : [vid_x, vid_y, ...]
 ```
 
-At 3,000 videos, a linear scan would also be fast. The value is implementing the pattern correctly — this is the exact structure underlying Elasticsearch, Lucene, and every production search engine. The answer to "why not just scan?" is: at this scale it wouldn't matter, but the structure is identical to real search indexes and demonstrates the pattern correctly.
+
 
 ### Min-Heap (Top-K Selection)
 
@@ -62,12 +62,18 @@ score = (0.35 × channel_affinity)
 
 | Component | Formula | Notes |
 |---|---|---|
-| channel_affinity | watch_count_for_channel / max_watch_count | Normalized 0–1. Only counts watches from subscribed channels — algorithm-surfaced history is too noisy. |
-| channel_satisfaction | From channel_scores table | Explicit y/n feedback. Defaults to 0.5 (neutral) — not 0.0, so unrated channels aren't penalized. |
+| channel_affinity | recency-decayed watch sum, normalized 0–1 | Exponential decay with ~140 day half-life. Recent watches count more than old ones. Only counts watches from subscribed channels — algorithm-surfaced history is too noisy. |
+| channel_satisfaction | From channel_scores table | Explicit y/n feedback rate. Defaults to 0.5 (neutral) — not 0.0, so unrated channels aren't penalised. Updated immediately when feedback is logged. |
 | category_weight | category_watch_fraction from taste profile | How much of your history falls in this video's category. |
 | like_ratio | like_count / (view_count + 1) | Objective quality signal. +1 avoids division by zero. |
 
 **Weight rationale:** w1 + w2 = 0.70 — personal taste signals dominate. w4 = 0.10 — intentionally small to avoid viral bias. All candidates are already unseen, so no recency penalty is needed.
+
+**Diversity cap:** After heap selection, results are filtered to a maximum of 2 videos per channel. This prevents a single high-affinity channel from dominating all 8 slots and ensures at least 4 distinct channels are represented per query.
+
+**Seen video window:** Rather than blacklisting every video ever watched, the unseen filter covers only the last 90 days. Videos older than the window become candidates again, preventing the pool from silently shrinking over time.
+
+**Score explanation:** Every result includes a `why` field naming the highest-contributing score component, and a `score_breakdown` dict with all four weighted values. Both are visible in CLI output and API responses.
 
 ---
 
@@ -85,13 +91,16 @@ Progress is logged every 10 channels using a shared counter protected by `thread
 
 ### 1. Prerequisites
 
-- Python 3.11+
+- Python 3.11+  
+  Earlier versions will produce syntax errors due to type hint syntax (`list[str]`, `tuple[x, y]`). Check with `python3 --version`.
 - A Google account with YouTube watch history
 
 ### 2. Get your Google Takeout export
 
+> **Note:** Google may take several hours — sometimes up to a day — to prepare your export. You'll receive an email when it's ready. The zip file may be large; you only need two files from it.
+
 1. Go to [takeout.google.com](https://takeout.google.com)
-2. Deselect all, select **YouTube and YouTube Music** only
+2. Deselect all, then select **YouTube and YouTube Music** only
 3. Click **Multiple formats** and change History format from HTML to **JSON**
 4. Export and download the zip
 5. Extract these two files into the `data/` folder:
@@ -103,8 +112,10 @@ Progress is logged every 10 channels using a shared counter protected by `thread
 1. Go to [console.cloud.google.com](https://console.cloud.google.com)
 2. Create a new project
 3. Enable **YouTube Data API v3**
-4. Go to **APIs & Services**, then **Credentials**, then **Create Credentials**, then **API key**
+4. Go to **APIs & Services → Credentials → Create Credentials → API key**
 5. Copy the key
+
+> **Quota:** The free tier gives you 10,000 units/day. A full ingest on ~65 subscriptions costs roughly 500–2,000 units. The weekly `refresh` command costs a similar amount. You are unlikely to hit the limit under normal use.
 
 ### 4. Configure
 
@@ -128,29 +139,18 @@ pip install flask
 ### 6. Ingest your data
 
 ```bash
-python3 -c "
-import sys; sys.path.insert(0, '.')
-from src.db import init_db
-from src.ingest.ingest import ingest_watch_history, ingest_subscriptions, ingest_subscription_videos
-init_db()
-ingest_watch_history('data/watch-history.json')
-ingest_subscriptions('data/subscriptions.csv')
-ingest_subscription_videos()
-"
+python3 ingest.py
 ```
 
-This fetches recent uploads from all your subscribed channels. Takes 1–3 minutes depending on how many subscriptions you have.
+This checks for your Takeout files, initialises the database, and fetches recent uploads from all your subscribed channels. Takes 1–3 minutes depending on how many subscriptions you have.
 
 ### 7. Use the CLI
 
 ```bash
 # Get recommendations
-python3 src/cli.py recommend --minutes 18 --mood interesting
+python3 src/cli.py recommend --minutes 18 --mood laugh
 
-# Available moods: interesting, funny, chill, educational, random
-
-# Rate a video after watching (y = satisfied, n = not)
-python3 src/cli.py rate --video-id VIDEO_ID --rating y --mood interesting --minutes 18
+# Available moods: laugh, learn, zone out, hobbies, stories, random
 
 # View stats
 python3 src/cli.py stats
@@ -158,6 +158,37 @@ python3 src/cli.py stats
 # Pull fresh uploads from your channels (run weekly)
 python3 src/cli.py refresh
 ```
+
+After printing results, the recommend command prompts you to rate what you watched:
+
+```
+Which video did you watch? (1-8, or Enter to skip):
+Did you enjoy it? (y/n, or Enter to skip):
+```
+
+Both prompts are optional — press Enter at either to exit cleanly. Ratings update channel scores immediately and refine future recommendations.
+
+If you need to rate a video outside of a recommend session:
+
+```bash
+python3 src/cli.py rate --video-id VIDEO_ID --rating y --mood laugh --minutes 18
+```
+
+---
+
+## Re-running & Refreshing
+
+`python3 ingest.py` is safe to re-run at any time:
+- Watch history uses `INSERT OR IGNORE` — duplicate entries are silently skipped
+- Subscriptions use `INSERT OR REPLACE` — rows are refreshed if titles or playlist IDs have changed
+- `ingest_subscription_videos()` only fetches metadata for video IDs not already in the DB, saving API quota
+
+To pull fresh uploads without re-importing Takeout data:
+```bash
+python3 src/cli.py refresh
+```
+
+To import a newer Takeout export, drop the new files into `data/` and re-run `python3 ingest.py`. Existing watch history is preserved; new entries are appended.
 
 ---
 
@@ -167,6 +198,7 @@ python3 src/cli.py refresh
 youtube-recommender/
 ├── config.py.example       # Copy to config.py and add your API key
 ├── requirements.txt
+├── ingest.py               # First-time setup: run once after Takeout import
 ├── data/                   # Drop Takeout files here (gitignored)
 ├── db/                     # SQLite database (gitignored)
 ├── logs/                   # Empty/failed channel logs
